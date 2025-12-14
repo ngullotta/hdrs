@@ -1,4 +1,4 @@
-use bincode::{Decode, Encode, config, encode_to_vec, decode_from_slice};
+use bincode::{Decode, Encode, config, encode_to_vec};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
