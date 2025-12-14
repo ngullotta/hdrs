@@ -31,7 +31,7 @@ impl DeltaEncoding {
         match self {
             DeltaEncoding::Tiny(v) => {
                 // Pack into 4 bits with 0b00 prefix
-                buffer.push(((*v as u8) & 0x0F));
+                buffer.push((*v as u8) & 0x0F);
             }
             DeltaEncoding::Small(v) => {
                 // 0b01 prefix + 8 bits

@@ -84,11 +84,11 @@ fn main() {
     println!("  Maximum relative error: {:.6}%\n", max_error * 100.0);
 
     println!("--- File I/O Test ---");
-    let filename = "financial_data.hdrs";
+    let filename = "/tmp/financial_data.hdrs";
     compressed.write_to_file(filename).unwrap();
     println!("✓ Written to: {}", filename);
     
-    let loaded = CompressedTimeSeries::read_from_file(filename).unwrap();
+    let _ = CompressedTimeSeries::read_from_file(filename).unwrap();
     println!("✓ Loaded from file");
     
     let blob = compressed.to_blob().unwrap();
