@@ -1,15 +1,14 @@
 use std::io;
 
-/// Variable-length integer encoding for deltas
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DeltaEncoding {
-    Tiny(i8),      // -7 to +7 basis points (4 bits)
-    Small(i16),    // -127 to +127 basis points (8 bits)
-    Large(i32),    // Full value
+    Tiny(i8),
+    Small(i16),
+    Large(i32),
 }
 
 impl DeltaEncoding {
-    pub fn from_basis_points(bp: i32) -> Self {
+    pub fn from_basis(bp: i32) -> Self {
         if bp >= -7 && bp <= 7 {
             DeltaEncoding::Tiny(bp as i8)
         } else if bp >= -127 && bp <= 127 {
@@ -19,7 +18,7 @@ impl DeltaEncoding {
         }
     }
 
-    pub fn to_basis_points(&self) -> i32 {
+    pub fn to_basis(&self) -> i32 {
         match self {
             DeltaEncoding::Tiny(v) => *v as i32,
             DeltaEncoding::Small(v) => *v as i32,
@@ -27,64 +26,86 @@ impl DeltaEncoding {
         }
     }
 
-    pub fn encode(&self, buffer: &mut Vec<u8>) {
+    pub fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             DeltaEncoding::Tiny(v) => {
                 // Pack into 4 bits with 0b00 prefix
-                buffer.push((*v as u8) & 0x0F);
+                buf.push((*v as u8) & 0x0F);
             }
             DeltaEncoding::Small(v) => {
                 // 0b01 prefix + 8 bits
-                buffer.push(0b01000000 | ((*v as u8) & 0x3F));
-                buffer.push(((*v >> 6) as u8) & 0xFF);
+                buf.push(0b01000000 | ((*v as u8) & 0x3F));
+                buf.push(((*v >> 6) as u8) & 0xFF);
             }
             DeltaEncoding::Large(v) => {
                 // 0b11 prefix + 32 bits
-                buffer.push(0b11000000);
-                buffer.extend_from_slice(&v.to_le_bytes());
+                buf.push(0b11000000);
+                buf.extend_from_slice(&v.to_le_bytes());
             }
         }
     }
 
-    pub fn decode(buffer: &[u8], pos: &mut usize) -> io::Result<Self> {
-        if *pos >= buffer.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Buffer underrun"));
+    pub fn decode(buf: &[u8], pos: &mut usize) -> io::Result<Self> {
+        if *pos >= buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Buffer underrun",
+            ));
         }
 
-        let first = buffer[*pos];
-        let prefix = first >> 6;
+        let first = buf[*pos];
+        let pre = first >> 6;
 
-        match prefix {
+        match pre {
+            // Tiny
             0b00 => {
-                // Tiny: 4 bits
-                let val = (first & 0x0F) as i8;
-                let val = if val > 7 { val - 16 } else { val };
+                let v = (first & 0x0F) as i8;
+                let v = if v > 7 { v - 16 } else { v };
                 *pos += 1;
-                Ok(DeltaEncoding::Tiny(val))
+                Ok(DeltaEncoding::Tiny(v))
             }
+            // Small
             0b01 => {
-                // Small: 14 bits
-                if *pos + 1 >= buffer.len() {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Buffer underrun"));
+                if *pos + 1 >= buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Buffer underrun",
+                    ));
                 }
-                let low = (first & 0x3F) as i16;
-                let high = buffer[*pos + 1] as i16;
-                let val = (high << 6) | low;
-                let val = if val > 8191 { val - 16384 } else { val };
+                let l = (first & 0x3F) as i16;
+                let h = buf[*pos + 1] as i16;
+                let v = (h << 6) | l;
+                let v = if v > 8191 { v - 16384 } else { v };
                 *pos += 2;
-                Ok(DeltaEncoding::Small(val))
+                Ok(DeltaEncoding::Small(v))
             }
+            // Large
             _ => {
-                // Large: 32 bits
-                if *pos + 4 >= buffer.len() {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Buffer underrun"));
+                if *pos + 4 >= buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Buffer underrun",
+                    ));
                 }
                 *pos += 1;
                 let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&buffer[*pos..*pos + 4]);
+                bytes.copy_from_slice(&buf[*pos..*pos + 4]);
                 *pos += 4;
                 Ok(DeltaEncoding::Large(i32::from_le_bytes(bytes)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_delta_encoding() {
+        let buf = [0b00111111];
+        let mut pos: usize = 0;
+        let res = DeltaEncoding::decode(&buf, &mut pos).unwrap();
+        assert_eq!(res, DeltaEncoding::Tiny(-1))
     }
 }

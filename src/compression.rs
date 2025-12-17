@@ -94,7 +94,7 @@ impl CompressedTimeSeries {
 
             // Write deltas
             for (_idx, _price, delta_bp) in deltas {
-                let encoding = DeltaEncoding::from_basis_points(delta_bp);
+                let encoding = DeltaEncoding::from_basis(delta_bp);
                 encoding.encode(&mut compressed_data);
             }
         }
@@ -179,7 +179,7 @@ impl CompressedTimeSeries {
                 let bit_idx = idx % 8;
                 if bitmap[byte_idx] & (1 << bit_idx) != 0 {
                     let delta_encoding = DeltaEncoding::decode(&self.compressed_data, &mut pos)?;
-                    let delta_bp = delta_encoding.to_basis_points();
+                    let delta_bp = delta_encoding.to_basis();
                     let prev_price = current_prices[idx];
                     current_prices[idx] = prev_price * (1.0 + delta_bp as f64 / 10000.0);
                 }
