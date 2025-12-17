@@ -1,383 +1,493 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::crc32::Crc32;
 use crate::delta_encoding::DeltaEncoding;
-use crate::types::{Tick, CompressionMetadata};
+use crate::types::{CompressionMetadata, Tick};
 
-/// Compressed financial time series
 pub struct CompressedTimeSeries {
     version: u8,
     symbols: Vec<String>,
-    base_timestamp: u64,
-    reference_frame: Vec<f64>,
-    compressed_data: Vec<u8>,
+    base_ts: u64,
+    ref_frame: Vec<f64>,
+    data: Vec<u8>,
     num_ticks: u32,
-    // Checksums for integrity verification
-    reference_checksum: u32,
-    data_checksum: u32,
-    overall_checksum: u32,
+    ref_crc: u32,
+    data_crc: u32,
+    overall_crc: u32,
 }
 
 impl CompressedTimeSeries {
-    /// Compress a time series of multi-symbol ticks
     pub fn compress(ticks: &[Tick]) -> io::Result<Self> {
         if ticks.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Empty tick data"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Empty tick data",
+            ));
         }
 
         let crc = Crc32::new();
-
-        // Build symbol dictionary from first tick
         let symbols: Vec<String> = ticks[0].prices.keys().cloned().collect();
-        let symbol_to_idx: HashMap<String, usize> = symbols
+        let sym_idx: HashMap<String, usize> = symbols
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
 
-        let num_symbols = symbols.len();
-        let base_timestamp = ticks[0].timestamp;
+        let n = symbols.len();
+        let base_ts = ticks[0].timestamp;
 
-        // Reference frame from first tick
-        let mut reference_frame = vec![0.0; num_symbols];
-        for (symbol, &price) in &ticks[0].prices {
-            if let Some(&idx) = symbol_to_idx.get(symbol) {
-                reference_frame[idx] = price;
+        let mut ref_frame = vec![0.0; n];
+        for (sym, &price) in &ticks[0].prices {
+            if let Some(&idx) = sym_idx.get(sym) {
+                ref_frame[idx] = price;
             }
         }
 
-        // Compute reference frame checksum
         let mut ref_bytes = Vec::new();
-        for &price in &reference_frame {
-            ref_bytes.extend_from_slice(&price.to_le_bytes());
+        for &p in &ref_frame {
+            ref_bytes.extend_from_slice(&p.to_le_bytes());
         }
-        let reference_checksum = crc.checksum(&ref_bytes);
+        let ref_crc = crc.checksum(&ref_bytes);
 
-        // Compress subsequent ticks
-        let mut compressed_data = Vec::new();
-        let mut prev_prices = reference_frame.clone();
+        let mut data = Vec::new();
+        let mut prev = ref_frame.clone();
 
         for tick in ticks.iter().skip(1) {
-            // Timestamp delta
-            let ts_delta = (tick.timestamp - base_timestamp) as u32;
-            compressed_data.extend_from_slice(&ts_delta.to_le_bytes());
+            let ts_delta = (tick.timestamp - base_ts) as u32;
+            data.extend_from_slice(&ts_delta.to_le_bytes());
 
-            // Build change bitmap
-            let mut changed_symbols = vec![false; num_symbols];
+            let mut changed = vec![false; n];
             let mut deltas = Vec::new();
 
-            for (symbol, &price) in &tick.prices {
-                if let Some(&idx) = symbol_to_idx.get(symbol) {
-                    let prev_price = prev_prices[idx];
-                    let delta_bp = ((price - prev_price) / prev_price * 10000.0).round() as i32;
-
+            for (sym, &price) in &tick.prices {
+                if let Some(&idx) = sym_idx.get(sym) {
+                    let delta_bp = ((price - prev[idx]) / prev[idx] * 10000.0).round() as i32;
                     if delta_bp != 0 {
-                        changed_symbols[idx] = true;
+                        changed[idx] = true;
                         deltas.push((idx, price, delta_bp));
-                        prev_prices[idx] = price;
+                        prev[idx] = price;
                     }
                 }
             }
 
-            // Write bitmap
-            let bitmap_bytes = (num_symbols + 7) / 8;
-            let mut bitmap = vec![0u8; bitmap_bytes];
-            for (idx, &changed) in changed_symbols.iter().enumerate() {
-                if changed {
-                    bitmap[idx / 8] |= 1 << (idx % 8);
+            let bm_bytes = (n + 7) / 8;
+            let mut bm = vec![0u8; bm_bytes];
+            for (idx, &ch) in changed.iter().enumerate() {
+                if ch {
+                    bm[idx / 8] |= 1 << (idx % 8);
                 }
             }
-            compressed_data.extend_from_slice(&bitmap);
+            data.extend_from_slice(&bm);
 
-            // Write deltas
-            for (_idx, _price, delta_bp) in deltas {
-                let encoding = DeltaEncoding::from_basis(delta_bp);
-                encoding.encode(&mut compressed_data);
+            for (_, _, delta_bp) in deltas {
+                DeltaEncoding::from_basis(delta_bp).encode(&mut data);
             }
         }
 
-        let data_checksum = crc.checksum(&compressed_data);
+        let data_crc = crc.checksum(&data);
 
         Ok(CompressedTimeSeries {
             version: 1,
             symbols,
-            base_timestamp,
-            reference_frame,
-            compressed_data,
+            base_ts,
+            ref_frame,
+            data,
             num_ticks: ticks.len() as u32,
-            reference_checksum,
-            data_checksum,
-            overall_checksum: 0,
+            ref_crc,
+            data_crc,
+            overall_crc: 0,
         })
     }
 
-    /// Decompress the entire time series
     pub fn decompress(&self) -> io::Result<Vec<Tick>> {
         let crc = Crc32::new();
 
-        // Verify reference frame integrity
         let mut ref_bytes = Vec::new();
-        for &price in &self.reference_frame {
-            ref_bytes.extend_from_slice(&price.to_le_bytes());
+        for &p in &self.ref_frame {
+            ref_bytes.extend_from_slice(&p.to_le_bytes());
         }
-        let computed_ref_checksum = crc.checksum(&ref_bytes);
-        if computed_ref_checksum != self.reference_checksum {
+        if crc.checksum(&ref_bytes) != self.ref_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Reference frame checksum mismatch: expected {}, got {}", 
-                    self.reference_checksum, computed_ref_checksum)
+                "Reference checksum mismatch",
             ));
         }
 
-        // Verify compressed data integrity
-        let computed_data_checksum = crc.checksum(&self.compressed_data);
-        if computed_data_checksum != self.data_checksum {
+        if crc.checksum(&self.data) != self.data_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Compressed data checksum mismatch: expected {}, got {}", 
-                    self.data_checksum, computed_data_checksum)
+                "Data checksum mismatch",
             ));
         }
 
         let mut ticks = Vec::with_capacity(self.num_ticks as usize);
-        let num_symbols = self.symbols.len();
+        let n = self.symbols.len();
 
-        // First tick is the reference frame
-        let mut first_tick_prices = HashMap::new();
-        for (i, symbol) in self.symbols.iter().enumerate() {
-            first_tick_prices.insert(symbol.clone(), self.reference_frame[i]);
+        let mut first = HashMap::new();
+        for (i, sym) in self.symbols.iter().enumerate() {
+            first.insert(sym.clone(), self.ref_frame[i]);
         }
         ticks.push(Tick {
-            timestamp: self.base_timestamp,
-            prices: first_tick_prices,
+            timestamp: self.base_ts,
+            prices: first,
         });
 
-        let mut current_prices = self.reference_frame.clone();
+        let mut curr = self.ref_frame.clone();
         let mut pos = 0;
-        let bitmap_bytes = (num_symbols + 7) / 8;
+        let bm_bytes = (n + 7) / 8;
 
-        while pos < self.compressed_data.len() {
-            if pos + 4 > self.compressed_data.len() {
+        while pos < self.data.len() {
+            if pos + 4 > self.data.len() {
                 break;
             }
-            let mut ts_bytes = [0u8; 4];
-            ts_bytes.copy_from_slice(&self.compressed_data[pos..pos + 4]);
-            let ts_delta = u32::from_le_bytes(ts_bytes);
+
+            let ts_delta = u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
-            if pos + bitmap_bytes > self.compressed_data.len() {
+            if pos + bm_bytes > self.data.len() {
                 break;
             }
-            let bitmap = &self.compressed_data[pos..pos + bitmap_bytes];
-            pos += bitmap_bytes;
+            let bm = &self.data[pos..pos + bm_bytes];
+            pos += bm_bytes;
 
-            for idx in 0..num_symbols {
-                let byte_idx = idx / 8;
-                let bit_idx = idx % 8;
-                if bitmap[byte_idx] & (1 << bit_idx) != 0 {
-                    let delta_encoding = DeltaEncoding::decode(&self.compressed_data, &mut pos)?;
-                    let delta_bp = delta_encoding.to_basis();
-                    let prev_price = current_prices[idx];
-                    current_prices[idx] = prev_price * (1.0 + delta_bp as f64 / 10000.0);
+            for idx in 0..n {
+                if bm[idx / 8] & (1 << (idx % 8)) != 0 {
+                    let enc = DeltaEncoding::decode(&self.data, &mut pos)?;
+                    let delta_bp = enc.to_basis();
+                    curr[idx] *= 1.0 + delta_bp as f64 / 10000.0;
                 }
             }
 
-            let mut tick_prices = HashMap::new();
-            for (i, symbol) in self.symbols.iter().enumerate() {
-                tick_prices.insert(symbol.clone(), current_prices[i]);
+            let mut prices = HashMap::new();
+            for (i, sym) in self.symbols.iter().enumerate() {
+                prices.insert(sym.clone(), curr[i]);
             }
             ticks.push(Tick {
-                timestamp: self.base_timestamp + ts_delta as u64,
-                prices: tick_prices,
+                timestamp: self.base_ts + ts_delta as u64,
+                prices,
             });
         }
 
         Ok(ticks)
     }
 
-    /// Serialize to bytes
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
         let crc = Crc32::new();
-        let mut buffer = Vec::new();
+        let mut buf = Vec::new();
 
-        buffer.write_all(&[self.version])?;
-        buffer.write_all(&(self.symbols.len() as u16).to_le_bytes())?;
-        buffer.write_all(&self.num_ticks.to_le_bytes())?;
-        buffer.write_all(&self.base_timestamp.to_le_bytes())?;
+        buf.write_all(&[self.version])?;
+        buf.write_all(&(self.symbols.len() as u16).to_le_bytes())?;
+        buf.write_all(&self.num_ticks.to_le_bytes())?;
+        buf.write_all(&self.base_ts.to_le_bytes())?;
 
-        for symbol in &self.symbols {
-            buffer.write_all(&(symbol.len() as u8).to_le_bytes())?;
-            buffer.write_all(symbol.as_bytes())?;
+        for sym in &self.symbols {
+            buf.write_all(&[sym.len() as u8])?;
+            buf.write_all(sym.as_bytes())?;
         }
 
-        for &price in &self.reference_frame {
-            buffer.write_all(&price.to_le_bytes())?;
+        for &p in &self.ref_frame {
+            buf.write_all(&p.to_le_bytes())?;
         }
 
-        buffer.write_all(&self.reference_checksum.to_le_bytes())?;
-        buffer.write_all(&self.data_checksum.to_le_bytes())?;
+        buf.write_all(&self.ref_crc.to_le_bytes())?;
+        buf.write_all(&self.data_crc.to_le_bytes())?;
+        buf.write_all(&(self.data.len() as u32).to_le_bytes())?;
+        buf.write_all(&self.data)?;
 
-        buffer.write_all(&(self.compressed_data.len() as u32).to_le_bytes())?;
-        buffer.write_all(&self.compressed_data)?;
+        let overall_crc = crc.checksum(&buf);
+        buf.write_all(&overall_crc.to_le_bytes())?;
 
-        let overall_checksum = crc.checksum(&buffer);
-        buffer.write_all(&overall_checksum.to_le_bytes())?;
-
-        Ok(buffer)
+        Ok(buf)
     }
 
-    /// Deserialize from bytes
     pub fn deserialize(data: &[u8]) -> io::Result<Self> {
         let crc = Crc32::new();
-        
+
         if data.len() < 4 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Data too short"));
         }
-        
-        let overall_checksum_pos = data.len() - 4;
-        let mut expected_checksum_bytes = [0u8; 4];
-        expected_checksum_bytes.copy_from_slice(&data[overall_checksum_pos..]);
-        let expected_checksum = u32::from_le_bytes(expected_checksum_bytes);
-        
-        let computed_checksum = crc.checksum(&data[..overall_checksum_pos]);
-        if computed_checksum != expected_checksum {
+
+        let crc_pos = data.len() - 4;
+        let overall_crc = u32::from_le_bytes(data[crc_pos..].try_into().unwrap());
+
+        if crc.checksum(&data[..crc_pos]) != overall_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Overall checksum mismatch: expected {}, got {}", 
-                    expected_checksum, computed_checksum)
+                "Overall checksum mismatch",
             ));
         }
 
         let mut pos = 0;
-
         let version = data[pos];
         pos += 1;
 
-        let mut num_symbols_bytes = [0u8; 2];
-        num_symbols_bytes.copy_from_slice(&data[pos..pos + 2]);
-        let num_symbols = u16::from_le_bytes(num_symbols_bytes) as usize;
+        let n = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
 
-        let mut num_ticks_bytes = [0u8; 4];
-        num_ticks_bytes.copy_from_slice(&data[pos..pos + 4]);
-        let num_ticks = u32::from_le_bytes(num_ticks_bytes);
+        let num_ticks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let mut base_ts_bytes = [0u8; 8];
-        base_ts_bytes.copy_from_slice(&data[pos..pos + 8]);
-        let base_timestamp = u64::from_le_bytes(base_ts_bytes);
+        let base_ts = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let mut symbols = Vec::with_capacity(num_symbols);
-        for _ in 0..num_symbols {
+        let mut symbols = Vec::with_capacity(n);
+        for _ in 0..n {
             let len = data[pos] as usize;
             pos += 1;
-            let symbol = String::from_utf8(data[pos..pos + len].to_vec())
+            let sym = String::from_utf8(data[pos..pos + len].to_vec())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            symbols.push(symbol);
+            symbols.push(sym);
             pos += len;
         }
 
-        let mut reference_frame = Vec::with_capacity(num_symbols);
-        for _ in 0..num_symbols {
-            let mut price_bytes = [0u8; 8];
-            price_bytes.copy_from_slice(&data[pos..pos + 8]);
-            reference_frame.push(f64::from_le_bytes(price_bytes));
+        let mut ref_frame = Vec::with_capacity(n);
+        for _ in 0..n {
+            ref_frame.push(f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
             pos += 8;
         }
 
-        let mut ref_checksum_bytes = [0u8; 4];
-        ref_checksum_bytes.copy_from_slice(&data[pos..pos + 4]);
-        let reference_checksum = u32::from_le_bytes(ref_checksum_bytes);
+        let ref_crc = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let mut data_checksum_bytes = [0u8; 4];
-        data_checksum_bytes.copy_from_slice(&data[pos..pos + 4]);
-        let data_checksum = u32::from_le_bytes(data_checksum_bytes);
+        let data_crc = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let mut compressed_len_bytes = [0u8; 4];
-        compressed_len_bytes.copy_from_slice(&data[pos..pos + 4]);
-        let compressed_len = u32::from_le_bytes(compressed_len_bytes) as usize;
+        let comp_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        let compressed_data = data[pos..pos + compressed_len].to_vec();
+        let comp_data = data[pos..pos + comp_len].to_vec();
 
         Ok(CompressedTimeSeries {
             version,
             symbols,
-            base_timestamp,
-            reference_frame,
-            compressed_data,
+            base_ts,
+            ref_frame,
+            data: comp_data,
             num_ticks,
-            reference_checksum,
-            data_checksum,
-            overall_checksum: expected_checksum,
+            ref_crc,
+            data_crc,
+            overall_crc,
         })
     }
 
-    pub fn compression_ratio(&self, original_size: usize) -> f64 {
-        let compressed_size = self.serialize().unwrap().len();
-        1.0 - (compressed_size as f64 / original_size as f64)
+    pub fn compression_ratio(&self, orig_size: usize) -> f64 {
+        let comp_size = self.serialize().unwrap().len();
+        1.0 - (comp_size as f64 / orig_size as f64)
     }
 
-    /// Write compressed data to a file
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        let serialized = self.serialize()?;
         let mut file = File::create(path)?;
-        file.write_all(&serialized)?;
-        file.sync_all()?;
-        Ok(())
+        file.write_all(&self.serialize()?)?;
+        file.sync_all()
     }
 
-    /// Read compressed data from a file
     pub fn read_from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let mut file = File::open(path)?;
-        let mut buffer = Vec::new();
-        use std::io::Read;
-        file.read_to_end(&mut buffer)?;
-        Self::deserialize(&buffer)
+        let mut buf = Vec::new();
+        File::open(path)?.read_to_end(&mut buf)?;
+        Self::deserialize(&buf)
     }
 
-    /// Write compressed data to a writer
-    pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
-        let serialized = self.serialize()?;
-        writer.write_all(&serialized)?;
-        Ok(serialized.len())
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<usize> {
+        let ser = self.serialize()?;
+        w.write_all(&ser)?;
+        Ok(ser.len())
     }
 
-    /// Read compressed data from a reader
-    pub fn read_from<R: std::io::Read>(reader: &mut R) -> io::Result<Self> {
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer)?;
-        Self::deserialize(&buffer)
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf)?;
+        Self::deserialize(&buf)
     }
 
-    /// Get the raw serialized bytes
     pub fn to_blob(&self) -> io::Result<Vec<u8>> {
         self.serialize()
     }
 
-    /// Create from raw blob bytes
     pub fn from_blob(blob: &[u8]) -> io::Result<Self> {
         Self::deserialize(blob)
     }
 
-    /// Get metadata without decompressing
     pub fn metadata(&self) -> CompressionMetadata {
         CompressionMetadata {
             version: self.version,
             num_symbols: self.symbols.len(),
             num_ticks: self.num_ticks as usize,
-            base_timestamp: self.base_timestamp,
+            base_timestamp: self.base_ts,
             symbols: self.symbols.clone(),
-            compressed_size: self.compressed_data.len(),
-            reference_checksum: self.reference_checksum,
-            data_checksum: self.data_checksum,
-            overall_checksum: self.overall_checksum,
+            compressed_size: self.data.len(),
+            reference_checksum: self.ref_crc,
+            data_checksum: self.data_crc,
+            overall_checksum: self.overall_crc,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn make_ticks() -> Vec<Tick> {
+        vec![
+            Tick {
+                timestamp: 1000,
+                prices: [("AAPL", 150.0), ("GOOGL", 2800.0)]
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect(),
+            },
+            Tick {
+                timestamp: 1001,
+                prices: [("AAPL", 150.5), ("GOOGL", 2805.0)]
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect(),
+            },
+            Tick {
+                timestamp: 1002,
+                prices: [("AAPL", 150.3), ("GOOGL", 2803.0)]
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_compress_decompress_roundtrip() {
+        let ticks = make_ticks();
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+        let decompressed = compressed.decompress().unwrap();
+
+        assert_eq!(ticks.len(), decompressed.len());
+        for (orig, decomp) in ticks.iter().zip(decompressed.iter()) {
+            assert_eq!(orig.timestamp, decomp.timestamp);
+            assert_eq!(orig.prices.len(), decomp.prices.len());
+            for (sym, &price) in &orig.prices {
+                let decomp_price = decomp.prices.get(sym).unwrap();
+                let rel_error = ((price - decomp_price) / price).abs();
+                assert!(
+                    rel_error < 0.01,
+                    "Price mismatch for {}: expected {}, got {} (rel error: {})",
+                    sym,
+                    price,
+                    decomp_price,
+                    rel_error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_roundtrip() {
+        let ticks = make_ticks();
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+        let serialized = compressed.serialize().unwrap();
+        let deserialized = CompressedTimeSeries::deserialize(&serialized).unwrap();
+
+        assert_eq!(compressed.version, deserialized.version);
+        assert_eq!(compressed.symbols, deserialized.symbols);
+        assert_eq!(compressed.base_ts, deserialized.base_ts);
+        assert_eq!(compressed.num_ticks, deserialized.num_ticks);
+        assert_eq!(compressed.ref_crc, deserialized.ref_crc);
+        assert_eq!(compressed.data_crc, deserialized.data_crc);
+    }
+
+    #[test]
+    fn test_empty_ticks_error() {
+        let result = CompressedTimeSeries::compress(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_checksum_validation() {
+        let ticks = make_ticks();
+        let mut compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+
+        compressed.data[0] ^= 0xFF;
+        let result = compressed.decompress();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_blob_operations() {
+        let ticks = make_ticks();
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+        let blob = compressed.to_blob().unwrap();
+        let restored = CompressedTimeSeries::from_blob(&blob).unwrap();
+
+        assert_eq!(compressed.symbols, restored.symbols);
+        assert_eq!(compressed.num_ticks, restored.num_ticks);
+    }
+
+    #[test]
+    fn test_writer_reader() {
+        let ticks = make_ticks();
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+
+        let mut buf = Vec::new();
+        let written = compressed.write_to(&mut buf).unwrap();
+        assert!(written > 0);
+
+        let mut cursor = Cursor::new(buf);
+        let restored = CompressedTimeSeries::read_from(&mut cursor).unwrap();
+
+        assert_eq!(compressed.symbols, restored.symbols);
+    }
+
+    #[test]
+    fn test_metadata() {
+        let ticks = make_ticks();
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+        let meta = compressed.metadata();
+
+        assert_eq!(meta.version, 1);
+        assert_eq!(meta.num_symbols, 2);
+        assert_eq!(meta.num_ticks, 3);
+        assert_eq!(meta.base_timestamp, 1000);
+        assert_eq!(meta.symbols.len(), 2);
+    }
+
+    #[test]
+    fn test_compression_ratio() {
+        let ticks = make_ticks();
+        let orig_size = ticks.len() * std::mem::size_of::<Tick>() * 10;
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+        let ratio = compressed.compression_ratio(orig_size);
+
+        assert!(ratio > 0.0 && ratio < 1.0);
+    }
+
+    #[test]
+    fn test_corrupted_overall_checksum() {
+        let ticks = make_ticks();
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+        let mut serialized = compressed.serialize().unwrap();
+
+        let len = serialized.len();
+        serialized[len - 1] ^= 0xFF;
+
+        let result = CompressedTimeSeries::deserialize(&serialized);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_tick() {
+        let ticks = vec![Tick {
+            timestamp: 1000,
+            prices: [("AAPL", 150.0)]
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
+        }];
+
+        let compressed = CompressedTimeSeries::compress(&ticks).unwrap();
+        let decompressed = compressed.decompress().unwrap();
+
+        assert_eq!(decompressed.len(), 1);
+        assert_eq!(decompressed[0].timestamp, 1000);
     }
 }
