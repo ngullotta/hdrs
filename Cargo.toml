@@ -6,7 +6,3 @@ edition = "2024"
 [dependencies]
 bincode = "2.0.1"
 sha2 = "0.10.9"
-
-[lib]
-name = "hdrs_compression"
-path = "src/lib.rs"
