@@ -1,4 +1,4 @@
-use cndl::{CompressedTimeSeries, Tick};
+use hdrs::{CompressedTimeSeries, Tick};
 use std::collections::HashMap;
 
 fn print_usage() {

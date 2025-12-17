@@ -1,3 +1,4 @@
 /target
 .cndl
 .vscode
+*.hdrs
