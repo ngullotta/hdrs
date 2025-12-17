@@ -1,6 +1,6 @@
 # HDRS - Hierarchical Delta-RLE Compression for Financial Time Series
 
-[![CI](https://github.com/ngullotta/hdrs/actions/workflows/rust.yml/badge.svg)](https://github.com/ngullotta/hdrs/actions/workflows/rust.yml)
+[![CI](https://github.com/ngullotta/hdrs/actions/workflows/ci.yml/badge.svg)](https://github.com/ngullotta/hdrs/actions/workflows/ci.yml)
 
 A high-performance Rust library for compressing multi-symbol financial time
 series data with built-in integrity verification.
