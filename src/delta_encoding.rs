@@ -8,14 +8,18 @@ pub enum DeltaEncoding {
 }
 
 impl DeltaEncoding {
-    pub fn from_basis(bp: i32) -> Self {
-        if bp >= -7 && bp <= 7 {
-            DeltaEncoding::Tiny(bp as i8)
-        } else if bp >= -127 && bp <= 127 {
-            DeltaEncoding::Small(bp as i16)
-        } else {
-            DeltaEncoding::Large(bp)
+    pub fn from_basis(bp: i32) -> io::Result<Self> {
+        if bp >= -8 && bp <= 7 {
+            return Ok(DeltaEncoding::Tiny(bp as i8));
+        } else if bp >= -8192 && bp <= 8191 {
+            return Ok(DeltaEncoding::Small(bp as i16));
+        } else if bp <= i32::MAX {
+            return Ok(DeltaEncoding::Large(bp));
         }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Basis must be between -8 and i32::MAX",
+        ));
     }
 
     pub fn to_basis(&self) -> i32 {
