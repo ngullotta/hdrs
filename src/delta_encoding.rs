@@ -34,10 +34,11 @@ impl DeltaEncoding {
         match self {
             DeltaEncoding::Tiny(v) => {
                 // Pack into 4 bits with 0b00 prefix
+                // @ToDo -> Maybe pack two of these together?
                 buf.push((*v as u8) & 0x0F);
             }
             DeltaEncoding::Small(v) => {
-                // 0b01 prefix + 8 bits
+                // 0b01 prefix + remaining bits + 8 bits
                 buf.push(0b01000000 | ((*v as u8) & 0x3F));
                 buf.push(((*v >> 6) as u8) & 0xFF);
             }
