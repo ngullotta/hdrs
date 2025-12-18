@@ -83,7 +83,7 @@ impl CompressedTimeSeries {
             data.extend_from_slice(&bm);
 
             for (_, _, delta_bp) in deltas {
-                DeltaEncoding::from_basis(delta_bp).encode(&mut data);
+                DeltaEncoding::from_basis(delta_bp)?.encode(&mut data);
             }
         }
 
