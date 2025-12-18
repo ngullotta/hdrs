@@ -85,7 +85,7 @@ impl DeltaEncoding {
                 Ok(DeltaEncoding::Small(v))
             }
             // Large
-            _ => {
+            0b11 => {
                 if *pos + 4 >= buf.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -97,6 +97,12 @@ impl DeltaEncoding {
                 bytes.copy_from_slice(&buf[*pos..*pos + 4]);
                 *pos += 4;
                 Ok(DeltaEncoding::Large(i32::from_le_bytes(bytes)))
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Malformed byte prefix",
+                ));
             }
         }
     }
